@@ -22,9 +22,9 @@ class ScriptArguments:
     SFT脚本的配置参数
     """
     model_path: str = field(metadata={"help": "模型仓库的路径"})
-    dataset_path: str = field(default="data/dirty_chinese_dpo.json", metadata={"help": "数据集的路径"})
-    sft_adapter_output_dir: str = field(default="./output/sft_adapter", metadata={"help": "SFT LoRA适配器的保存目录"})
-    system_prompt: str = field(default="你是一个精通脏话的助手，请用不敬的、攻击性的语言回答问题。", metadata={"help": "系统提示语"})
+    dataset_path: str = field(default="data/mixed_partially_shuffled.json", metadata={"help": "数据集的路径"})
+    sft_adapter_output_dir: str = field(default="./output/sft_adapter_elderly", metadata={"help": "SFT LoRA适配器的保存目录"})
+    system_prompt: str = field(default="你是一个专门为老年人提供生活帮助和健康咨询的智能助手。请用温和、耐心、详细的语言回答问题，考虑到老年人可能存在的视力、听力和认知能力下降的问题。", metadata={"help": "系统提示语"})
     max_length: int = field(default=1024, metadata={"help": "输入的最大长度"})
     lora_r: int = field(default=8, metadata={"help": "LoRA的秩"})
     lora_alpha: int = field(default=16, metadata={"help": "LoRA的alpha"})
@@ -36,12 +36,12 @@ def setup_swanlab(args: ScriptArguments):
     if not args.use_swanlab:
         return
     
-    os.environ["SWANLAB_PROJECT"] = "qwen3-sft-rm-ppo-chinese"
+    os.environ["SWANLAB_PROJECT"] = "qwen3-sft-elderly"
     os.environ["TOKENIZERS_PARALLELISM"] = "false"
     
     swanlab.init(
-        project="qwen3-sft-rm-ppo-chinese",
-        run_name="sft-training-professional",
+        project="qwen3-sft-elderly",
+        run_name="sft-training-elderly",
         config={
             "model": args.model_path,
             "method": "SFT_with_Trainer",
@@ -54,8 +54,7 @@ def setup_swanlab(args: ScriptArguments):
 
 def load_and_format_dataset(dataset_path, system_prompt):
     """
-    加载DPO JSON文件，并将其转换为SFT的 instruction, input, output 格式.
-    我们只使用 "chosen" 的回答进行监督微调。
+    加载老年人关怀JSON文件，并将其转换为SFT的 instruction, input, output 格式.
     """
     try:
         with open(dataset_path, 'r', encoding='utf-8') as f:
@@ -66,16 +65,28 @@ def load_and_format_dataset(dataset_path, system_prompt):
     
     formatted_data = []
     for item in data:
-        if 'conversations' in item and 'chosen' in item:
-            human_input = "".join([turn['value'] + "\n" for turn in item['conversations'] if turn.get('from') == 'human']).strip()
-            chosen_response = item['chosen'].get('value', '')
+        # 新数据集格式直接包含 instruction, input, output 字段
+        instruction = item.get('instruction', '')
+        input_text = item.get('input', '')
+        output_text = item.get('output', '')
+        system_text = item.get('system', system_prompt)  # 如果数据中有system字段则使用，否则使用默认的
+        
+        # 如果没有明确的instruction，使用默认的系统提示语
+        if not instruction:
+            instruction = system_text
             
-            if human_input and chosen_response:
-                formatted_data.append({
-                    "instruction": system_prompt,
-                    "input": human_input,
-                    "output": chosen_response
-                })
+        if input_text and output_text:
+            formatted_data.append({
+                "instruction": instruction,
+                "input": input_text,
+                "output": output_text
+            })
+        elif instruction and output_text:  # 有些数据可能没有input字段
+            formatted_data.append({
+                "instruction": instruction,
+                "input": "",
+                "output": output_text
+            })
     return formatted_data
 
 def main():
@@ -106,22 +117,36 @@ def main():
         tokenizer.pad_token_id = tokenizer.eos_token_id
     
     def process_func(example):
-        instruction_part = tokenizer(
-            f"<|im_start|>system\n{example['instruction']}<|im_end|>\n<|im_start|>user\n{example['input']}<|im_end|>\n<|im_start|>assistant\n",
-            add_special_tokens=False,
-        )
-        response_part = tokenizer(f"{example['output']}<|im_end|>", add_special_tokens=False)
+        # 根据新数据集的特点调整格式
+        if example['input']:
+            full_input = f"{example['instruction']}\n\n{example['input']}"
+        else:
+            full_input = example['instruction']
+            
+        # 构造聊天模板格式的输入
+        chat = [
+            {"role": "system", "content": example['instruction']},
+            {"role": "user", "content": example['input']},
+            {"role": "assistant", "content": example['output']}
+        ]
         
-        input_ids = instruction_part["input_ids"] + response_part["input_ids"] + [tokenizer.eos_token_id]
-        attention_mask = instruction_part["attention_mask"] + response_part["attention_mask"] + [1]
-        labels = [-100] * len(instruction_part["input_ids"]) + response_part["input_ids"] + [tokenizer.eos_token_id]
-
-        if len(input_ids) > args.max_length:
-            input_ids = input_ids[:args.max_length]
-            attention_mask = attention_mask[:args.max_length]
+        # 应用聊天模板
+        prompt = tokenizer.apply_chat_template(chat[:-1], tokenize=False, add_generation_prompt=True)
+        full_text = prompt + example['output'] + tokenizer.eos_token
+        
+        # Tokenize完整文本
+        model_inputs = tokenizer(full_text, max_length=args.max_length, truncation=True)
+        
+        # 创建labels（只对assistant的回复计算损失）
+        prompt_ids = tokenizer(prompt, add_special_tokens=False)['input_ids']
+        labels = [-100] * len(prompt_ids) + model_inputs["input_ids"][len(prompt_ids):]
+        
+        # 确保labels不会超过最大长度
+        if len(labels) > args.max_length:
             labels = labels[:args.max_length]
             
-        return {"input_ids": input_ids, "attention_mask": attention_mask, "labels": labels}
+        model_inputs["labels"] = labels
+        return model_inputs
 
     print("🚀 4. 对数据集进行Tokenization...")
     tokenized_train_ds = train_dataset.map(process_func, remove_columns=train_dataset.column_names)
@@ -149,17 +174,17 @@ def main():
 
     print("🚀 6. 配置训练参数...")
     training_args = TrainingArguments(
-        output_dir="./output/sft_model_temp",
+        output_dir="./output/elderly/sft_model_temp_elderly",
         per_device_train_batch_size=1,
         gradient_accumulation_steps=4,
         learning_rate=1e-4,
         num_train_epochs=1,
         logging_steps=10,
         save_strategy="epoch",
-        eval_strategy="epoch", # 在每个epoch后进行评估
+        eval_strategy="epoch",
         gradient_checkpointing=True,
         report_to="swanlab" if args.use_swanlab else "none",
-        run_name="sft-training-run-professional",
+        run_name="sft-training-elderly",
     )
 
     print("🚀 7. 创建并启动Trainer...")
@@ -167,7 +192,7 @@ def main():
         model=model,
         args=training_args,
         train_dataset=tokenized_train_ds,
-        eval_dataset=tokenized_eval_ds, # 传入评估数据集
+        eval_dataset=tokenized_eval_ds,
         data_collator=DataCollatorForSeq2Seq(tokenizer=tokenizer, padding=True),
     )
     trainer.train()

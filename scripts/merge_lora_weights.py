@@ -4,7 +4,7 @@ from peft import PeftModel
 import os
 
 # --- 配置 ---
-BASE_MODEL_PATH = "/home/space/space/model/Qwen3-1.7B"
+BASE_MODEL_PATH = "./Qwen3/Qwen3-1.7B"
 SFT_ADAPTER_PATH = "./output/sft_adapter"
 MERGED_MODEL_OUTPUT_PATH = "./output/sft_merged_model"
 

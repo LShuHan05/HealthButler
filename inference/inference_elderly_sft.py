@@ -27,15 +27,8 @@ class ElderlySFTChatbot:
         self.tokenizer = AutoTokenizer.from_pretrained(
             self.base_model_path, use_fast=False, trust_remote_code=True
         )
-        # 设置pad_token，避免与eos_token相同导致警告
         if self.tokenizer.pad_token is None:
-            # 优先使用unk_token，如果没有则使用eos_token
-            if self.tokenizer.unk_token is not None:
-                self.tokenizer.pad_token = self.tokenizer.unk_token
-            else:
-                self.tokenizer.pad_token = self.tokenizer.eos_token
-                # 如果pad_token和eos_token相同，设置不同的pad_token_id
-                self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
+            self.tokenizer.pad_token = self.tokenizer.eos_token
 
         self.model = AutoModelForCausalLM.from_pretrained(
             self.base_model_path,
@@ -62,7 +55,6 @@ class ElderlySFTChatbot:
         with torch.no_grad():
             outputs = self.model.generate(
                 input_ids=inputs.input_ids,
-                attention_mask=inputs.attention_mask,  # 显式传递attention_mask
                 max_new_tokens=max_new_tokens,
                 temperature=temperature,
                 top_p=top_p,
